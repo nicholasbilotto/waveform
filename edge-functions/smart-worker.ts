@@ -266,8 +266,10 @@ Deno.serve(async (req) => {
             name: r.spot_metadata.name,
             slug: r.spot_metadata.slug,
             sun_data: { sunrise: fmt(sunTimes.sunrise), sunset: fmt(sunTimes.sunset) },
+            // Compact tide summary (next high/low + current direction)
+            tide_summary: summarizeTides(r.tides),
             // Apply Token Saver Here
-            forecast_summary: compressHourlyData(r.forecast_timeline) 
+            forecast_summary: compressHourlyData(r.forecast_timeline)
         };
     });
 
@@ -298,6 +300,7 @@ Deno.serve(async (req) => {
       3. Pick the SINGLE best spot.
       4. Assess Paddle Difficulty and Dangers.
       5. Use the EXACT Sunrise/Sunset times provided in the "sun_data" field above. Do not calculate your own.
+      6. Factor in tides (see "tide_summary"): low tide exposes reef breaks, high tide is better for beach breaks. Prefer an optimal_time aligned with the favorable tide window.
 
       STRICT JSON FORMATTING & LENGTH RULES:
       - "human_scale": Must be exactly two numbers separated by a dash (e.g., "3-5"). NO "ft", NO text.
