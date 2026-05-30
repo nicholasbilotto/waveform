@@ -52,8 +52,7 @@ export default function HomeScreen() {
     // 3. REFRESH HANDLER
     const onRefresh = async () => {
         setRefreshing(true);
-        // FALSE: Do not force an AI token burn. Just get the latest cached data.
-        await refreshAll(true); 
+        await refreshAll(true);
         setRefreshing(false);
     };
 
