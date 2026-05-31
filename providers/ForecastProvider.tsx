@@ -15,6 +15,11 @@ type ForecastContextType = {
     setFavoriteSpots: React.Dispatch<React.SetStateAction<string[]>>; // Added this
     refreshAll: (force?: boolean) => Promise<void>;  // daily only
     fetchWeekly: (force?: boolean) => Promise<void>; // lazy weekly
+    // Single-spot lazy load (swipe pager)
+    fetchSpotDetail: (slug: string) => Promise<any>;
+    spotDetails: Record<string, any>;          // keyed by slug
+    spotDetailLoading: Record<string, boolean>; // keyed by slug
+    spotDetailErrors: Record<string, string>;   // keyed by slug
 };
 
 const ForecastContext = createContext<ForecastContextType>({
@@ -30,7 +35,14 @@ const ForecastContext = createContext<ForecastContextType>({
     setFavoriteSpots: () => {}, // Added this
     refreshAll: async () => {},
     fetchWeekly: async () => {},
+    fetchSpotDetail: async () => null,
+    spotDetails: {},
+    spotDetailLoading: {},
+    spotDetailErrors: {},
 });
+
+// 2h cache window for a single-spot detail (matches the worker's AI TTL)
+const SPOT_DETAIL_CACHE_MS = 2 * 60 * 60 * 1000;
 
 // Helper: invoke an Edge Function with a hard timeout
 const invokeEdge = async <TData = any>(
@@ -71,6 +83,13 @@ export const ForecastProvider = ({ children }: { children: React.ReactNode }) =>
     const [error, setError] = useState<string | null>(null);
     const [weeklyError, setWeeklyError] = useState<string | null>(null);
     const [favoriteSpots, setFavoriteSpots] = useState<string[]>([]);
+
+    // Single-spot detail state (swipe pager lazy-load)
+    const [spotDetails, setSpotDetails] = useState<Record<string, any>>({});
+    const [spotDetailLoading, setSpotDetailLoading] = useState<Record<string, boolean>>({});
+    const [spotDetailErrors, setSpotDetailErrors] = useState<Record<string, string>>({});
+    const spotDetailFetchTimes = useRef<Record<string, number>>({});
+    const inFlightSlugsRef = useRef<Set<string>>(new Set());
 
     const lastFetchTime = useRef<number>(0);
     const activeUser = useRef<string | null>(null);
@@ -212,6 +231,53 @@ export const ForecastProvider = ({ children }: { children: React.ReactNode }) =>
         }
     };
 
+    // Lazy single-spot fetch for the swipe pager. Deduped + 2h cached per slug.
+    const fetchSpotDetail = async (slug: string) => {
+        if (!user || !slug) return null;
+
+        // Serve from cache if fresh
+        const fetchedAt = spotDetailFetchTimes.current[slug] || 0;
+        if (spotDetails[slug] && (Date.now() - fetchedAt < SPOT_DETAIL_CACHE_MS)) {
+            return spotDetails[slug];
+        }
+
+        // De-dupe in-flight requests for the same slug
+        if (inFlightSlugsRef.current.has(slug)) return null;
+        inFlightSlugsRef.current.add(slug);
+
+        setSpotDetailLoading(prev => ({ ...prev, [slug]: true }));
+        setSpotDetailErrors(prev => {
+            if (!prev[slug]) return prev;
+            const next = { ...prev };
+            delete next[slug];
+            return next;
+        });
+
+        try {
+            const localHour = new Date().getHours();
+            const response = await invokeEdge("smart-worker", {
+                single_spot: slug,
+                user_id: user.id,
+                client_hour: localHour,
+            });
+            if (response.error) throw new Error(response.error.message || "Spot detail API Error");
+            if ((response.data as any)?.error) throw new Error((response.data as any).error);
+
+            // Worker returns a single card object; tolerate an array wrap.
+            const card = Array.isArray(response.data) ? (response.data as any)[0] : response.data;
+            setSpotDetails(prev => ({ ...prev, [slug]: card }));
+            spotDetailFetchTimes.current[slug] = Date.now();
+            return card;
+        } catch (err: any) {
+            console.error(`🌊 Spot detail error (${slug}):`, err);
+            setSpotDetailErrors(prev => ({ ...prev, [slug]: err.message || "Connection failed" }));
+            return null;
+        } finally {
+            setSpotDetailLoading(prev => ({ ...prev, [slug]: false }));
+            inFlightSlugsRef.current.delete(slug);
+        }
+    };
+
     useEffect(() => {
         if (user && (user.id !== activeUser.current || !isInitialized)) {
             activeUser.current = user.id;
@@ -233,6 +299,10 @@ export const ForecastProvider = ({ children }: { children: React.ReactNode }) =>
             setFavoriteSpots,
             refreshAll,
             fetchWeekly,
+            fetchSpotDetail,
+            spotDetails,
+            spotDetailLoading,
+            spotDetailErrors,
         }}>
             {children}
         </ForecastContext.Provider>

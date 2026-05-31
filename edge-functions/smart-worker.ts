@@ -170,22 +170,215 @@ function summarizeTides(tides: Tide[], now: Date = new Date()) {
   };
 }
 
+// --- HELPER: Build a candidate object for the AI prompt from a weather report ---
+function buildCandidate(r: any, targetDate: Date) {
+  const sunTimes = SunCalc.getTimes(targetDate, r.spot_metadata.lat, r.spot_metadata.lng);
+  const fmt = (d: Date) => d.toLocaleTimeString("en-US", {
+    hour: 'numeric',
+    minute: '2-digit',
+    timeZone: "America/Los_Angeles"
+  });
+
+  return {
+    name: r.spot_metadata.name,
+    slug: r.spot_metadata.slug,
+    sun_data: { sunrise: fmt(sunTimes.sunrise), sunset: fmt(sunTimes.sunset) },
+    tide_summary: summarizeTides(r.tides),
+    forecast_summary: compressHourlyData(r.forecast_timeline),
+  };
+}
+
 Deno.serve(async (req) => {
   if (req.method === 'OPTIONS') return new Response('ok', { headers: corsHeaders });
 
   try {
-    const { favorite_spots, user_id, client_hour = 12, force_refresh = false } = await req.json();
-
-    if (!favorite_spots || !Array.isArray(favorite_spots) || favorite_spots.length === 0) {
-      throw new Error("Missing 'favorite_spots' array.");
-    }
-    if (!user_id) throw new Error("Missing 'user_id'.");
+    const body = await req.json();
 
     const supabase = createClient(
       Deno.env.get('SUPABASE_URL') ?? '',
       Deno.env.get('SUPABASE_SERVICE_ROLE_KEY') ?? ''
     );
     const GEMINI_KEY = Deno.env.get('GEMINI_API_KEY');
+
+    // --- SINGLE-SPOT MODE (swipe pager lazy-load) ---
+    // Short-circuits the multi-spot "pick a winner" logic. Weather is usually
+    // warm in the cache from the daily call, so this only pays for one Gemini call.
+    if (body.single_spot && body.user_id) {
+      const slug: string = body.single_spot;
+      const user_id: string = body.user_id;
+      const client_hour: number = body.client_hour ?? 12;
+      const force_refresh: boolean = body.force_refresh ?? false;
+
+      // Profile (for tone, quiver, wetsuits)
+      const { data: userProfile, error: userError } = await supabase
+        .from('profiles').select('*').eq('id', user_id).single();
+      if (userError) throw new Error("User profile not found");
+
+      // Time window
+      const isTomorrow = client_hour >= 20;
+      const dayLabel = isTomorrow ? "TOMORROW" : "TODAY";
+      const targetDate = new Date();
+      if (isTomorrow) targetDate.setDate(targetDate.getDate() + 1);
+      const dateString = targetDate.toLocaleDateString("en-US", { weekday: 'long', month: 'long', day: 'numeric' });
+
+      // AI cache check
+      const cacheKey = `single-${slug}-v5-${user_id}`;
+      const { data: aiCache } = await supabase
+        .from('ai_content_cache')
+        .select('*')
+        .eq('location_slug', cacheKey)
+        .eq('user_id', user_id)
+        .single();
+
+      const cacheTime = aiCache ? new Date(aiCache.updated_at).getTime() : 0;
+      const profileTime = userProfile.updated_at ? new Date(userProfile.updated_at).getTime() : 0;
+      const aiIsStale = !aiCache?.ai_response || force_refresh ||
+        (new Date().getTime() - cacheTime > 2 * 60 * 60 * 1000) ||
+        (profileTime > cacheTime);
+
+      if (!aiIsStale) {
+        return new Response(JSON.stringify(aiCache.ai_response), {
+          headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+          status: 200,
+        });
+      }
+
+      // Look up the spot
+      const { data: spotRow, error: spotErr } = await supabase
+        .from('spots').select('*').eq('slug', slug).single();
+      if (spotErr || !spotRow) throw new Error(`Spot '${slug}' not found`);
+
+      // Fetch weather (warm cache likely)
+      const report = await fetchWeatherForSpot(spotRow, supabase, client_hour);
+      if (!report) throw new Error(`Weather fetch failed for '${slug}'`);
+
+      // Tone (same logic as the daily call)
+      const skill = userProfile.skill_level || "Intermediate";
+      let toneInstruction = "Use standard surf terminology. Be helpful and clear.";
+      if (['Advanced', 'Pro'].some(s => skill.includes(s))) {
+        toneInstruction = "Use technical, precise surf terminology. Keep analysis concise and expert-level.";
+      }
+      const quiverList = userProfile.quiver && userProfile.quiver.length > 0
+        ? userProfile.quiver.join(", ")
+        : userProfile.favorite_board || "Surfboard";
+      const wetsuitList = userProfile.wetsuits && userProfile.wetsuits.length > 0
+        ? userProfile.wetsuits.join(", ")
+        : "3/2mm, 4/3mm, Trunks";
+
+      const candidate = buildCandidate(report, targetDate);
+
+      const genAI = new GoogleGenerativeAI(GEMINI_KEY!);
+      const model = genAI.getGenerativeModel({
+        model: "gemini-3-flash-preview",
+        generationConfig: { responseMimeType: "application/json" }
+      });
+
+      const prompt = `
+        You are an expert Surf Guide. ${toneInstruction}
+
+        THE CONTEXT:
+        - Current User Time: ${client_hour}:00
+        - Forecasting For: ${dayLabel} (${dateString})
+        - User Skill: ${skill}
+        - User Quiver (STRICT): [${quiverList}]
+        - User Wetsuits (STRICT): [${wetsuitList}]
+
+        THE SPOT (Hourly Forecast Data):
+        ${JSON.stringify(candidate)}
+
+        YOUR TASK:
+        1. Analyze conditions for THIS ONE SPOT for ${dayLabel}.
+        2. IMPORTANT: If forecasting for TODAY, ONLY recommend an "optimal_time" that starts AFTER ${client_hour}:00.
+        3. Assess Paddle Difficulty and Dangers.
+        4. Use the EXACT Sunrise/Sunset times provided in the "sun_data" field above. Do not calculate your own.
+        5. Factor in tides (see "tide_summary"): low tide exposes reef breaks, high tide is better for beach breaks. Prefer an optimal_time aligned with the favorable tide window.
+
+        STRICT JSON FORMATTING & LENGTH RULES:
+        - "human_scale": Must be exactly two numbers separated by a dash (e.g., "3-5"). NO "ft", NO text.
+        - "human_relation": Text description of size (e.g. "Waist to Chest High").
+        - "why_it_won": MAX 10 WORDS. Concise highlight of this spot's conditions.
+        - "wave_description": MAX 2 SENTENCES. Focus on shape/power/surface texture. No fluff.
+        - "optimal_window_description": MAX 2 Sentences. Poetic summary of the session.
+        - "optimal_window_condition": MAX 3 WORDS. Explain the LIMITER (e.g., "Heavy Winds").
+        - "paddle_difficulty": MAX 5 WORDS. e.g. "Moderate - heavy drift".
+        - "danger_description": MAX 5 WORDS. e.g. "Shallow reef, urchins".
+        - "is_tomorrow": Boolean. true if forecasting for tomorrow.
+        - "board_recommendation": MUST be an EXACT string match from the User Quiver list provided above.
+        - "board_rec_description": MAX 10 WORDS. Punchy reason.
+        - "suggested_wetsuit": MUST be an EXACT string match from the User Wetsuits list provided above.
+        - "sun": MUST be strictly ["sunrise string from data", "sunset string from data"]
+
+        OUTPUT FORMAT (JSON Only, a SINGLE object — NOT an array):
+        {
+          "spot_info": {
+              "name": "${report.spot_metadata.name}",
+              "slug": "${report.spot_metadata.slug}",
+              "rating": "Good",
+              "human_scale": "3-5",
+              "human_relation": "Waist to Chest"
+          },
+          "ai_analysis": {
+            "is_tomorrow": ${isTomorrow},
+            "why_it_won": "Highlight of conditions...",
+            "wave_description": "Wave shape description...",
+            "optimal_time": [start_hour_int, end_hour_int],
+            "optimal_window_description": "Wind turns onshore at 2pm, but fades away as the sun goes down",
+            "optimal_window_condition": "Light Winds",
+            "sun": ["6:15 AM", "7:45 PM"],
+            "board_recommendation": "Fish",
+            "board_rec_description": "Perfect for these mushy sections.",
+            "paddle_difficulty": "Easy Channel Paddle",
+            "danger_description": "Crowded lineup"
+          },
+          "metadata": { "water_temp": "64°F", "suggested_wetsuit": "3/2mm", "crowd_prediction": "Moderate" }
+        }
+      `;
+
+      const result = await model.generateContent(prompt);
+      const responseText = result.response.text();
+
+      let card: any;
+      try {
+        const parsed = JSON.parse(responseText);
+        // Tolerate the model wrapping the object in an array.
+        card = Array.isArray(parsed) ? parsed[0] : parsed;
+      } catch (parseError) {
+        console.error("Single-spot AI JSON Parse Failed. Raw Text:", responseText);
+        throw new Error("AI returned invalid JSON.");
+      }
+
+      // Force the correct slug/name (model can drift) and attach raw data.
+      card.spot_info = card.spot_info || {};
+      card.spot_info.slug = report.spot_metadata.slug;
+      card.spot_info.name = report.spot_metadata.name;
+      card.raw_data = {
+        forecast: report.forecast_timeline,
+        tides: report.tides,
+      };
+
+      await supabase.from('ai_content_cache').upsert(
+        {
+          location_slug: cacheKey,
+          user_id: user_id,
+          ai_response: card,
+          updated_at: new Date().toISOString()
+        },
+        { onConflict: 'location_slug,user_id' }
+      );
+
+      return new Response(JSON.stringify(card), {
+        headers: { ...corsHeaders, 'Content-Type': 'application/json' },
+        status: 200,
+      });
+    }
+
+    // --- MULTI-SPOT (DAILY) MODE ---
+    const { favorite_spots, user_id, client_hour = 12, force_refresh = false } = body;
+
+    if (!favorite_spots || !Array.isArray(favorite_spots) || favorite_spots.length === 0) {
+      throw new Error("Missing 'favorite_spots' array.");
+    }
+    if (!user_id) throw new Error("Missing 'user_id'.");
 
     // --- 0. PRE-FETCH USER PROFILE ---
     const { data: userProfile, error: userError } = await supabase
@@ -254,24 +447,7 @@ Deno.serve(async (req) => {
         : "3/2mm, 4/3mm, Trunks"; 
 
     // --- 4. PREPARE COMPRESSED AI PROMPT DATA ---
-    const compressedCandidates = validReports.map(r => {
-        const sunTimes = SunCalc.getTimes(targetDate, r.spot_metadata.lat, r.spot_metadata.lng);
-        const fmt = (d: Date) => d.toLocaleTimeString("en-US", {
-            hour: 'numeric', 
-            minute:'2-digit',
-            timeZone: "America/Los_Angeles"
-        });
-        
-        return {
-            name: r.spot_metadata.name,
-            slug: r.spot_metadata.slug,
-            sun_data: { sunrise: fmt(sunTimes.sunrise), sunset: fmt(sunTimes.sunset) },
-            // Compact tide summary (next high/low + current direction)
-            tide_summary: summarizeTides(r.tides),
-            // Apply Token Saver Here
-            forecast_summary: compressHourlyData(r.forecast_timeline)
-        };
-    });
+    const compressedCandidates = validReports.map(r => buildCandidate(r, targetDate));
 
     // --- 5. AI GENERATION ---
     const genAI = new GoogleGenerativeAI(GEMINI_KEY!);
