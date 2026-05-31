@@ -1,5 +1,6 @@
 import { SpotSelector } from "@/components/SpotSelector";
 import BottomSheet from "@gorhom/bottom-sheet";
+import { useFocusEffect } from "@react-navigation/native";
 import {
     Clock,
     Edit2,
@@ -7,7 +8,7 @@ import {
     TriangleAlert,
     Wind
 } from "lucide-react-native";
-import React, { useRef, useState } from "react";
+import React, { useCallback, useRef, useState } from "react";
 import {
     ActivityIndicator,
     FlatList,
@@ -45,19 +46,27 @@ type SpotData = {
 };
 
 export default function WeeklyForecastScreen() {
-    const { weeklyForecast: data, loading, error, favoriteSpots, refreshAll, setFavoriteSpots, isInitialized } = useForecast();
+    const { weeklyForecast: data, weeklyLoading, weeklyError, favoriteSpots, refreshAll, fetchWeekly, setFavoriteSpots, isInitialized } = useForecast();
   const { user } = useAuth();
-  
+
   // Local UI State
   const [refreshing, setRefreshing] = useState(false);
   const bottomSheetRef = useRef<BottomSheet>(null);
   const spotsChangedRef = useRef(false);
 
-  // 3. REFRESH HANDLER
+  // Lazy-load the weekly forecast when this tab gains focus (only if not already loaded)
+  useFocusEffect(
+      useCallback(() => {
+          if (!data) {
+              fetchWeekly();
+          }
+      }, [data])
+  );
+
+  // 3. REFRESH HANDLER (force-refresh the weekly forecast)
   const onRefresh = async () => {
       setRefreshing(true);
-      // FALSE: Do not force an AI token burn. Just get the latest cached data.
-      await refreshAll(true); 
+      await fetchWeekly(true);
       setRefreshing(false);
   };
 
@@ -65,8 +74,8 @@ export default function WeeklyForecastScreen() {
 
   // --- RENDER CONTENT LOGIC ---
   const renderContent = () => {
-      // 4. Loading State 
-      if ((!isInitialized) || (loading && !refreshing)) {
+      // 4. Loading State
+      if (weeklyLoading && !refreshing) {
         return (
             <View className="flex-1 items-center justify-center">
                 <ActivityIndicator size="large" color="#22d3ee" />
@@ -78,9 +87,9 @@ export default function WeeklyForecastScreen() {
       }
 
     // 5. ERROR STATE
-    if (error && !data) {
+    if (weeklyError && !data) {
         // Check if Google's servers are the culprit
-        const isHighDemand = error.includes("503") || error.toLowerCase().includes("high demand");
+        const isHighDemand = weeklyError.includes("503") || weeklyError.toLowerCase().includes("high demand");
 
         return (
             <View className="flex-1 items-center justify-center px-8">
@@ -93,14 +102,14 @@ export default function WeeklyForecastScreen() {
                 </Text>
                 
                 <Text className="text-white/40 text-center mb-8 leading-5 font-medium">
-                    {isHighDemand 
-                        ? "The AI is currently catching too many waves. Give it a minute to paddle back out and try again." 
-                        : error}
+                    {isHighDemand
+                        ? "The AI is currently catching too many waves. Give it a minute to paddle back out and try again."
+                        : weeklyError}
                 </Text>
 
-                <TouchableOpacity 
-                    className="bg-cyan-500 px-10 py-4 rounded-full shadow-lg shadow-cyan-500/40" 
-                    onPress={() => refreshAll(true)}
+                <TouchableOpacity
+                    className="bg-cyan-500 px-10 py-4 rounded-full shadow-lg shadow-cyan-500/40"
+                    onPress={() => fetchWeekly(true)}
                 >
                     <Text className="text-black font-black uppercase tracking-widest text-xs">
                         Try Again
@@ -252,7 +261,8 @@ export default function WeeklyForecastScreen() {
     onClose={() => {
         // ⚡ ONLY run the heavy AI fetch if they actually made edits
         if (spotsChangedRef.current) {
-            refreshAll(true);
+            refreshAll(true);   // keep daily in sync
+            fetchWeekly(true);  // weekly tab needs a forced refresh too
             spotsChangedRef.current = false; // Reset the flag for next time
         }
     }}
