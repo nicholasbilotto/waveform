@@ -1,3 +1,4 @@
+import { SwellChart, WindChart } from "@/components/DataCards";
 import { SpotSelector } from "@/components/SpotSelector";
 import { supabase } from "@/lib/supabase";
 import { useAuth } from "@/providers/AuthProvider";
@@ -278,12 +279,10 @@ function SpotCard({ forecast, loading, slug, onRefresh, refreshing }: SpotCardPr
             <View className="mt-4">
                 {forecast?.raw_data?.forecast ? (
                     <>
+                        <SwellChart forecast={forecast.raw_data.forecast} />
+                        <WindChart forecast={forecast.raw_data.forecast} />
                     </>
-                ) : (
-                    <View className="bg-white/5 p-6 rounded-[32px] items-center">
-                        <Text className="text-white/40 text-xs">Timeline data unavailable</Text>
-                    </View>
-                )}
+                ) : null}
             </View>
         </ScrollView>
     );
